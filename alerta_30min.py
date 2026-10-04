@@ -1,20 +1,25 @@
 """
-Alerta de estadísticas al minuto 30 de cada partido -> Telegram (para GitHub Actions)
+Alerta de estadísticas entre el minuto 30 y 44 del primer tiempo -> Telegram (GitHub Actions)
 
-Variables de entorno (en GitHub: Settings > Secrets and variables > Actions):
+Cada ejecución es CORTA (sin esperas): consulta ESPN, mira qué partidos están en vivo,
+envía las estadísticas de los que van entre el minuto 30 y el 44 del 1er tiempo y que
+todavía no se hayan enviado, y termina. Se dispara cada pocos minutos (cron-job.org
+y, de respaldo, el cron de GitHub), así que si una ejecución falla o se salta, la
+siguiente cubre el partido.
+
+Estado: 'enviados.json' (en el repositorio) recuerda qué partidos ya se enviaron.
+
+Secretos (Settings > Secrets and variables > Actions):
     TELEGRAM_BOT_TOKEN   token del bot (BotFather)
     TELEGRAM_CHAT_ID     id del chat/grupo/canal
 
-Se ejecuta cada hora (minuto :50) y se encarga de los partidos cuyo inicio (hora Bogotá)
-cae en la hora siguiente, p. ej. la ejecución de las 10:50 atiende los partidos de 11:00 a 11:59.
-Espera hasta que cada partido llegue al minuto 30 para enviar sus estadísticas.
-La ejecución de la ventana de las 06:00 además envía la agenda completa del día.
-
 Uso manual:
-    python alerta_30min.py            # ventana según la hora actual
-    python alerta_30min.py --probar   # solo envía un mensaje de prueba
+    python alerta_30min.py             # ejecución normal
+    python alerta_30min.py --probar    # solo envía un mensaje de prueba
+    python alerta_30min.py --simular   # no envía ni guarda: imprime lo que haría
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -40,17 +45,15 @@ LIGAS = {
 }
 
 TZ_LOCAL = timezone(timedelta(hours=-5))      # Colombia: UTC-5 fijo
-VENTANAS = [(h, h + 1) for h in range(24)]    # una ventana por hora
-ADELANTO_MIN = 15         # la ejecución de las HH:50 ya atiende la ventana de la hora siguiente
-HORA_AGENDA = 6           # ventana en la que se envía la agenda del día
-
-MINUTO_OBJETIVO = 30      # minuto de juego para enviar
-MINUTO_MAX_ENVIO = 40     # si ya pasó de este minuto, no se envía (alerta tardía)
-ANTICIPO_MIN = 3          # empieza a consultar 3 min antes de kickoff+30
-ABANDONAR_MIN = 100       # minutos desde el inicio programado tras los cuales se abandona
+MINUTO_OBJETIVO = 30        # desde este minuto del 1er tiempo se envía
+MINUTO_MAX_ENVIO = 44       # pasado este minuto ya no se envía (alerta tardía)
+HORA_AGENDA = (6, 9)        # la agenda del día se envía en la primera ejecución entre las 06:00 y las 08:59
+DIAS_ESTADO = 3             # días que se conserva el historial de enviados
 HILOS = 6
 
 BASE = 'https://site.api.espn.com/apis/site/v2/sports/soccer'
+ESTADO = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'enviados.json')
+SIMULAR = False
 
 TRAD = {
     'possessionPct': 'Posesión %',
@@ -100,6 +103,37 @@ def get_json(url, intentos=3):
     return None
 
 
+def marcador(c):
+    s = c.get('score')
+    s = s.get('displayValue') if isinstance(s, dict) else s
+    return s if s not in (None, '') else '0'
+
+
+def minuto_de(reloj):
+    m = re.match(r'\d+', reloj or '')
+    return int(m.group()) if m else None
+
+
+# ------------------------------- Estado -------------------------------
+
+def cargar_estado():
+    try:
+        with open(ESTADO, encoding='utf-8') as f:
+            e = json.load(f)
+    except (OSError, ValueError):
+        e = {}
+    e.setdefault('partidos', {})
+    e.setdefault('agenda', '')
+    return e
+
+
+def guardar_estado(e):
+    limite = (datetime.now(TZ_LOCAL) - timedelta(days=DIAS_ESTADO)).isoformat()
+    e['partidos'] = {k: v for k, v in e['partidos'].items() if v >= limite}
+    with open(ESTADO, 'w', encoding='utf-8') as f:
+        json.dump(e, f, indent=1, sort_keys=True)
+
+
 # ------------------------------- Telegram -------------------------------
 
 def esc(s):
@@ -107,6 +141,12 @@ def esc(s):
 
 
 def enviar_telegram(texto, html=False):
+    if SIMULAR:
+        print('--- (simulado) mensaje a Telegram ---')
+        print(texto)
+        print('--- fin ---')
+        return True
+
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat = os.environ.get('TELEGRAM_CHAT_ID')
     if not token or not chat:
@@ -140,7 +180,7 @@ def enviar_telegram(texto, html=False):
     return ok
 
 
-# ------------------------------ Partidos de hoy ------------------------------
+# ------------------------------ Agenda del día ------------------------------
 
 def a_hora_local(fecha_iso):
     dt = datetime.strptime(fecha_iso, '%Y-%m-%dT%H:%MZ').replace(tzinfo=timezone.utc)
@@ -169,8 +209,6 @@ def partidos_liga(codigo, nombre, hoy):
             if not local or not visita:
                 continue
             partidos[e['id']] = {
-                'id': e['id'],
-                'cod': codigo,
                 'liga': nombre,
                 'inicio': inicio,
                 'local': local['team']['displayName'],
@@ -187,38 +225,56 @@ def partidos_del_dia(hoy):
     return todos
 
 
-# ------------------------------ Minuto 30 ------------------------------
+# ------------------------------ Partidos en vivo ------------------------------
 
-def procesar(p):
-    """Devuelve 'enviado', 'descartar' o 'esperar'."""
+def en_vivo_liga(codigo, nombre):
+    """Partidos de la liga que están en juego ahora (state == 'in').
+
+    Se consultan por fecha (ayer y hoy en UTC) porque el marcador sin fecha de las
+    selecciones/copas puede mostrar otra jornada.
+    """
+    hoy_utc = datetime.now(timezone.utc).date()
+    vivos = {}
+    for delta in (-1, 0):
+        dia = hoy_utc + timedelta(days=delta)
+        data = get_json(f'{BASE}/{codigo}/scoreboard?dates={dia:%Y%m%d}')
+        for e in (data or {}).get('events', []):
+            comp = e['competitions'][0]
+            status = comp.get('status') or e.get('status') or {}
+            if (status.get('type') or {}).get('state') != 'in':
+                continue
+            local = next((c for c in comp['competitors'] if c.get('homeAway') == 'home'), None)
+            visita = next((c for c in comp['competitors'] if c.get('homeAway') == 'away'), None)
+            if not local or not visita:
+                continue
+            reloj = status.get('displayClock') or ''
+            vivos[e['id']] = {
+                'id': e['id'],
+                'cod': codigo,
+                'liga': nombre,
+                'periodo': status.get('period') or 1,
+                'reloj': reloj,
+                'minuto': minuto_de(reloj),
+                'id_l': local['team']['id'],
+                'id_v': visita['team']['id'],
+                'local': local['team']['displayName'],
+                'visita': visita['team']['displayName'],
+                'g_l': marcador(local),
+                'g_v': marcador(visita),
+            }
+    return list(vivos.values())
+
+
+def toca_enviar(p):
+    return (p['periodo'] == 1 and p['minuto'] is not None
+            and MINUTO_OBJETIVO <= p['minuto'] <= MINUTO_MAX_ENVIO)
+
+
+def enviar_estadisticas(p):
+    """Trae las estadísticas del partido y las envía. True si se envió."""
     data = get_json(f"{BASE}/{p['cod']}/summary?event={p['id']}")
     if not data:
-        return 'esperar'
-    comps = (data.get('header') or {}).get('competitions') or []
-    if not comps:
-        return 'esperar'
-    comp = comps[0]
-    status = comp.get('status') or {}
-    estado = (status.get('type') or {}).get('state')
-
-    if estado == 'post':
-        return 'descartar'
-    if estado != 'in':
-        return 'esperar'
-
-    periodo = status.get('period') or 1
-    m = re.match(r'\d+', status.get('displayClock') or '')
-    minuto = int(m.group()) if m else None
-
-    if periodo > 1 or (minuto is not None and minuto > MINUTO_MAX_ENVIO):
-        log(f"  {p['local']} vs {p['visita']}: ya pasó el minuto de envío, se omite")
-        return 'descartar'
-    if minuto is None or minuto < MINUTO_OBJETIVO:
-        return 'esperar'
-
-    local = next(c for c in comp['competitors'] if c.get('homeAway') == 'home')
-    visita = next(c for c in comp['competitors'] if c.get('homeAway') == 'away')
-    id_l, id_v = local['team']['id'], visita['team']['id']
+        return False
 
     stats, orden = {}, []
     for t in (data.get('boxscore') or {}).get('teams', []):
@@ -229,83 +285,76 @@ def procesar(p):
                 orden.append(clave)
             stats[clave]['v'][t['team']['id']] = s.get('displayValue')
 
-    cabecera = (f"⏱ {status.get('displayClock', '')} · {p['liga']}\n"
-                f"⚽ {local['team']['displayName']} {local.get('score', '0')} - "
-                f"{visita.get('score', '0')} {visita['team']['displayName']}\n")
+    cabecera = (f"⏱ {p['reloj']} · {p['liga']}\n"
+                f"⚽ {p['local']} {p['g_l']} - {p['g_v']} {p['visita']}\n")
 
     if not orden:
-        ok = enviar_telegram(esc(cabecera) + '\nSin estadísticas disponibles todavía.', html=True)
-        return 'enviado' if ok else 'esperar'
+        return enviar_telegram(esc(cabecera) + '\nSin estadísticas disponibles todavía.', html=True)
 
     tabla = ''
     for k in orden:
         e = stats[k]
-        tabla += f"{str(e['v'].get(id_l, '-')):>6}  {e['label']:<17}  {e['v'].get(id_v, '-')}\n"
+        tabla += f"{str(e['v'].get(p['id_l'], '-')):>6}  {e['label']:<17}  {e['v'].get(p['id_v'], '-')}\n"
     msg = (f"{esc(cabecera)}\n<pre>{esc(tabla)}</pre>\n"
-           f"{esc('Local: ' + local['team']['displayName'] + ' | Visita: ' + visita['team']['displayName'])}")
-    return 'enviado' if enviar_telegram(msg, html=True) else 'esperar'
+           f"{esc('Local: ' + p['local'] + ' | Visita: ' + p['visita'])}")
+    return enviar_telegram(msg, html=True)
 
 
 # ------------------------------------ Main ------------------------------------
 
 def main():
+    global SIMULAR
     ap = argparse.ArgumentParser()
     ap.add_argument('--probar', action='store_true', help='envía un mensaje de prueba y termina')
+    ap.add_argument('--simular', action='store_true', help='no envía ni guarda; imprime lo que haría')
     args = ap.parse_args()
+    SIMULAR = args.simular
 
     if args.probar:
         ok = enviar_telegram('✅ Prueba desde GitHub Actions: el bot está conectado.')
         sys.exit(0 if ok else 1)
 
-    ref = datetime.now(TZ_LOCAL) + timedelta(minutes=ADELANTO_MIN)
-    hoy = ref.date()
-    ini, fin = next((v for v in VENTANAS if v[0] <= ref.hour < v[1]), VENTANAS[0])
-    log(f'Fecha {hoy} · ventana {ini:02d}:00-{fin:02d}:00 (hora Bogotá)')
+    estado = cargar_estado()
+    cambio = False
+    ahora = datetime.now(TZ_LOCAL)
+    hoy = ahora.date()
 
-    todos = partidos_del_dia(hoy)
-    log(f'{len(todos)} partidos hoy en total')
-
-    if ini == HORA_AGENDA:   # agenda completa del día
+    # 1) Agenda del día (una sola vez, en la primera ejecución de la mañana)
+    if HORA_AGENDA[0] <= ahora.hour < HORA_AGENDA[1] and estado['agenda'] != str(hoy):
+        todos = partidos_del_dia(hoy)
         msg = f'📅 Partidos de hoy ({hoy}): {len(todos)}\n'
         if not todos:
             msg += 'No hay partidos en las ligas configuradas.'
         for p in todos:
             msg += f"\n{p['inicio']:%H:%M} · {p['liga']}: {p['local']} vs {p['visita']}"
-        enviar_telegram(msg)
+        if enviar_telegram(msg):
+            estado['agenda'] = str(hoy)
+            cambio = True
+            log(f'Agenda enviada ({len(todos)} partidos)')
 
-    pendientes = [p for p in todos if ini <= p['inicio'].hour < fin]
-    log(f'{len(pendientes)} partidos en esta ventana')
+    # 2) Partidos en vivo que ya van entre el minuto 30 y el 44
+    with ThreadPoolExecutor(max_workers=HILOS) as ex:
+        res = list(ex.map(lambda x: en_vivo_liga(*x), LIGAS.items()))
+    vivos = [p for lista in res for p in lista]
+    log(f'{len(vivos)} partidos en vivo')
+    for p in vivos:
+        pendiente = p['id'] not in estado['partidos']
+        log(f"  {p['local']} vs {p['visita']} · {p['reloj']} (t{p['periodo']})"
+            f"{' · ya enviado' if not pendiente else ''}")
 
-    while pendientes:
-        ahora = datetime.now(TZ_LOCAL)
-        siguientes = []
-        activos = False
-        for p in pendientes:
-            desde_inicio = (ahora - p['inicio']).total_seconds() / 60
-            if desde_inicio < MINUTO_OBJETIVO - ANTICIPO_MIN:
-                siguientes.append(p)
-                continue
-            if desde_inicio > ABANDONAR_MIN:
-                log(f"  se abandona {p['local']} vs {p['visita']} (sin datos a tiempo)")
-                continue
-            activos = True
-            res = procesar(p)
-            if res == 'enviado':
-                log(f"  enviado: {p['local']} vs {p['visita']}")
-            elif res == 'esperar':
-                siguientes.append(p)
-        pendientes = siguientes
-        if not pendientes:
-            break
-
-        if activos:
-            time.sleep(60)
+    for p in vivos:
+        if p['id'] in estado['partidos'] or not toca_enviar(p):
+            continue
+        if enviar_estadisticas(p):
+            estado['partidos'][p['id']] = ahora.isoformat()
+            cambio = True
+            log(f"  enviado: {p['local']} vs {p['visita']}")
         else:
-            primero = min(p['inicio'] for p in pendientes) + timedelta(minutes=MINUTO_OBJETIVO - ANTICIPO_MIN)
-            espera = (primero - datetime.now(TZ_LOCAL)).total_seconds()
-            time.sleep(max(15, min(300, espera)))
+            log(f"  no se pudo enviar {p['local']} vs {p['visita']}; se reintenta en la próxima ejecución")
 
-    log('Ventana terminada')
+    if cambio and not SIMULAR:
+        guardar_estado(estado)
+    log('Listo')
 
 
 if __name__ == '__main__':
