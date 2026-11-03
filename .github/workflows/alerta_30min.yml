@@ -1,1 +1,57 @@
+name: Alerta minuto 30
+
+on:
+  schedule:
+    # Respaldo: GitHub puede retrasar o saltarse ejecuciones. El disparo principal
+    # es cron-job.org (cada 5 min) llamando a la API de GitHub (workflow_dispatch).
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      probar:
+        description: 'Solo enviar mensaje de prueba a Telegram'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # para guardar enviados.json
+
+concurrency:
+  group: alerta-30min
+  cancel-in-progress: false
+
+jobs:
+  alerta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependencias
+        run: pip install requests
+
+      - name: Ejecutar
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.probar }}" = "true" ]; then
+            python alerta_30min.py --probar
+          else
+            python alerta_30min.py
+          fi
+
+      - name: Guardar estado
+        run: |
+          if [ -n "$(git status --porcelain enviados.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add enviados.json
+            git commit -m "Actualiza enviados.json"
+            git pull --rebase origin main
+            git push
+          fi
 
